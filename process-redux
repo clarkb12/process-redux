@@ -1,0 +1,412 @@
+#!/usr/bin/env ruby
+
+# vim: set filetype=ruby:
+
+require 'bbc/redux'
+require 'fileutils'
+require 'json'
+require 'optparse'
+require 'optparse/date'
+require 'ostruct'
+require 'securerandom'
+require 'time'
+require 'typhoeus'
+require 'yell'
+require 'aws-sdk'
+
+$PROGRAM_NAME = File.basename(__FILE__)
+
+def params_to_string(p)
+  buffer = ''
+  i = 0
+  p.each do |key, value|
+	  if i > 0
+		  buffer += ","
+          end
+	  buffer += "#{key}:#{value.gsub(':','\\:')}"
+          i += 1
+  end
+  return buffer
+end
+
+def get_asset(options, job, disk_reference, bucket)
+  local_path = File.join(options.results, "#{disk_reference}_hi.mp4.cdm")
+  if !File.exists?(local_path)
+    remote_key = File.join(job[:executions].detect{|e|e[:status] == 'completed'}[:metadata][:output_uri], "#{disk_reference}h264_hi.mp4.cdm")[1..-1]
+    object  = bucket.object(remote_key)
+    if object.exists?
+      object.get(response_target: local_path)
+    end
+  end 
+end
+
+def get_errors(options, job, disk_reference, bucket)
+  local_path = File.join(options.results, "#{disk_reference}.err")
+  if !File.exists?(local_path)
+    remote_key = File.join(job[:executions].detect{|e|e[:status] == 'failed'}[:metadata][:output_uri], "logs/stderr.log")[1..-1]
+    object  = bucket.object(remote_key)
+    if object.exists?
+      object.get(response_target: local_path)
+    end 
+  end
+end
+
+def get_output(options, job, disk_reference, bucket)
+  local_path = File.join(options.results, "#{disk_reference}.out")
+  if !File.exists?(local_path)
+    remote_key = File.join(job[:executions].detect{|e|e[:status] == 'failed'}[:metadata][:output_uri], "logs/stout.log")[1..-1]
+    object  = bucket.object(remote_key)
+    if object.exists?
+      object.get(response_target: local_path)
+    end 
+  end
+end
+
+def results(options, logger)
+  begin
+    file = File.new(options.filename, "r")
+    data = JSON.parse(file.read, :symbolize_names => true)
+
+    meta = Hash.new
+    pending = 0
+    completed = 0
+    cancelled = 0
+    failed = 0
+
+    bucket = Aws::S3::Bucket.new(options.s3_bucket)
+    data[:jobs].each do |job|
+      logger.info job[:id]
+      url = "http://#{options.host}:#{options.port.to_s}/api/jobs/#{job[:id]}?api_key=#{options.token}"
+      response = Typhoeus.get(url) 
+	if !response.success?
+	  raise "Could not retrieve status for  job #{job['id']} from #{url}"
+	end
+        begin
+	  data = JSON.parse(response.body, :symbolize_names => true)
+          case data[:status]
+	    when 'completed'	    
+              get_asset(options, data, job[:disk_reference], bucket)
+              completed += 1
+            when 'failed'
+              get_errors(options, data, job[:disk_reference], bucket)
+              get_output(options, data, job[:disk_reference], bucket)
+              failed += 1
+            when 'pending'
+              pending += 1
+            when 'cancelled'
+              cancelled += 1
+	  end
+	rescue JSON::ParserError => e
+	  raise "Expected valid JSON response from comma"
+        end
+    end
+    meta[:pending] = pending
+    meta[:completed] = completed
+    meta[:cancelled] = cancelled
+    meta[:failed] = failed
+    puts meta
+  ensure
+    file.close unless file.nil?
+  end
+end
+
+def status(options, logger)
+  begin
+    file = File.new(options.filename, "r")
+    data = JSON.parse(file.read, :symbolize_names => true)
+    url = "http://#{options.host}:#{options.port.to_s}/api/jobs/summary?api_key=#{options.token}"
+    logger.info(url)
+    jobParams = Hash.new
+    jobParams[:tags] = data[:batch]
+    response = Typhoeus.get(url, :params => jobParams) 
+	if !response.success?
+	  raise "Could not retrieve status for  job #{data[:batch]} to #{url}"
+	end
+        begin
+	  data = JSON.parse(response.body, :symbolize_names => true)
+	  puts data
+	rescue JSON::ParserError => e
+	  raise "Expected valid JSON response from comma"
+        end
+  ensure
+    file.close
+  end
+end
+
+def query(options, logger)
+  redux_client = BBC::Redux::Client.new({
+    :username => options.username,
+    :password => options.password,
+  })
+
+  jobs = Array.new
+  params = Hash.new
+  meta = Hash.new
+  out = Hash.new
+  out[:jobs] = jobs
+  out[:params] = params
+  out[:meta] = meta
+  out[:batch] = SecureRandom.uuid
+  
+  options.tags = out[:batch]
+  pending = 0
+  completed = 0
+  cancelled = 0
+  failed = 0
+
+  params[:offset] = 0
+  params[:limit] = 25
+  params[:sort_by] = 'time'
+  params[:sort_order] = 'ascending'
+  if !options.channels.nil?
+    params[:channel] = options.channels
+  end
+
+  if !options.q.nil?
+    params[:q] = options.q
+  end
+
+  if options.titleonly
+    params[:titleonly] = 1
+  else
+    params[:titleonly] = 0
+  end
+
+  if !options.after.nil?
+    params[:after] = options.after.iso8601
+  end
+
+  if !options.before.nil?
+    params[:before] = options.before.iso8601
+  end
+  logger.info params 
+  results = redux_client.search( params )
+
+  while true do
+    results.assets.each do |asset|
+      url = "http://#{options.host}:#{options.port.to_s}/api/jobs?api_key=#{options.token}"
+      jobParams = Hash.new
+      jobParams[:algorithm] = 'commma'
+      jobParams[:input] = "redux://diskref/#{asset.disk_reference}.h264_hi"
+      jobParams[:parameters] = params_to_string({ 'container' => options.algorithm,
+				 'source'=>'Redux', 
+				 'sourceId' => asset.disk_reference, 
+				 'identifier' => asset.disk_reference, 
+				 'broadcastDate' => asset.start.to_datetime.rfc3339
+			      })
+      logger.info "#{asset.disk_reference} #{asset.name} #{asset.start}"
+      jobParams[:tags] = options.tags
+      if !options.dryRun
+        response = Typhoeus.post(url, :body => jobParams) 
+	if !response.success?
+	  raise "Could not submit job #{jobParams} to #{url}"
+	end
+        begin
+	  data = JSON.parse(response.body)
+          jobs.push({ :id =>data[:id],:disk_reference => asset.disk_reference, :start => asset.start })
+	  pending += 1
+	rescue JSON::ParserError => e
+	  raise "Expected valid JSON response from comma"
+        end
+      end	
+    end
+    if results.has_more?
+      next_query = results.query.merge({
+        :offset => results.query[:offset] + results.query[:limit]
+      })
+      results = redux_client.search(next_query)
+    else
+      break
+    end
+  end
+
+  meta[:pending] = pending
+  meta[:completed] = completed
+  meta[:failed] = failed
+  meta[:cancelled] = cancelled
+
+  File.open("#{out[:batch]}.json","w") do |f|
+    f.write(out.to_json)
+  end
+  puts meta.to_json
+ensure
+  redux_client.logout unless redux_client.nil?
+end
+
+###############################################################################
+# OPTIONS
+
+options = OpenStruct.new(
+  verbose: false,
+  help: false,
+  dryRun: false,
+  action: "query",
+  token: ENV["COMMA_API_TOKEN"],
+  username: ENV["REDUX_USERNAME"],
+  password: ENV["REDUX_PASSWORD"],
+  host: ENV["COMMA_WEB_HOSTNAME"],
+  port: ENV["COMMA_WEB_PORT"], 
+  results: nil,
+  s3_bucket: ENV["COMMA_RESULT_STORE_S3_BUCKET"],
+  channels: nil,
+  q: nil,
+  titleonly: false,
+  after: nil,
+  before: nil,
+  tags: [],
+  algorithm:'comma-docker.virt.ch.bbc.co.uk/codam/engine'
+)
+
+parser = OptionParser.new do |opts|
+  opts.banner = "usage: #{$PROGRAM_NAME} [options] jobfile [resultsdir]"
+
+  opts.separator ''
+  opts.separator 'Process files from Redux on comma'
+
+  opts.on('-v', '--[no-]verbose', 'Verbose output') do |v|
+    options.verbose = v
+  end
+
+  opts.on('-h', '--help', 'Print this help message') do
+    options.help = true
+  end
+
+  opts.on('-a', '--action ACTION', 'Action to run [query, status, results]') do | action |
+    options.action = action
+  end
+
+  opts.on('-d', '--dryRun', 'Query Redux but don\'t launch jobs on comma') do
+    options.dryRun = true
+  end
+
+  opts.on("-t", "--token COMMA_API_TOKEN", "Use API_TOKEN to call comma") do | token |
+    options.token = token
+  end
+
+  opts.on("-u", "--username REDUX_USERNAME", "BBC Redux Username") do |username|
+    options.username = username
+  end
+  
+  opts.on("-p", "--password REDUX_PASSWORD", "BBC Redux Password") do |password|
+    options.password = password
+  end
+
+  opts.on("-s", "--s3 S3_BUCKET", "s3 bucket to retrieve results from") do |s3_bucket|
+    options.s3_bucket = s3_bucket
+  end
+
+  opts.on("--host COMMA_WEB_HOSTNAME", "comma hostname") do |host|
+    options.host = host
+  end
+
+  opts.on("--port COMMA_WEB_PORT", "comma port") do |port|
+    options.port = port
+  end
+
+  opts.on("--channels CHANNELS", Array, "Channels to search over") do |channels|
+    options.channels = channels
+  end
+
+  opts.on("-q","--query QUERY", "Query String") do |q|
+    options.q = q
+  end
+
+  opts.on("--titleonly", "Query the title only") do 
+    options.titleonly = true
+  end
+
+  opts.on("--after AFTER",DateTime, "Query after this date") do |after|
+    options.after = after
+  end
+
+  opts.on("--before BEFORE",DateTime, "Query before this date") do |before|
+    options.before = before
+  end
+
+  opts.on("--tags TAGS", "Tags separated by commas") do |tags|
+    options.tags = tags
+  end
+end
+
+begin
+  parser.parse!(ARGV)
+  options.filename = ARGV.shift
+  options.results = ARGV.shift
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+  puts "#{e.message.capitalize}. See '#{$PROGRAM_NAME} --help'."
+  exit 1
+end
+
+if options.help
+  puts parser.help
+  exit
+end
+if options.verbose
+  logger = Yell.new do |l|
+    l.level = 'gte.debug'
+    l.adapter STDOUT, level: [:debug, :info, :warn]
+    l.adapter STDERR, level: [:error, :fatal]
+  end
+else
+  logger = Yell.new do |l|
+    l.level = 'gte.warn'
+    l.adapter STDOUT, level: [:debug, :info, :warn]
+    l.adapter STDERR, level: [:error, :fatal]
+  end
+end
+
+begin
+  if options.host.nil? or options.host.empty?
+    raise "Please set the comma host (via the --host flag or COMMA_WEB_HOSTNAME environmental variable)"
+  end
+
+  if options.port.nil? or options.port.empty?
+    raise "Please set the comma port (via the --port flag or COMMA_WEB_PORT environmental variable)"
+  end
+
+  if options.token.nil? or options.token.empty?
+    raise "Please set the comma api token (via the --token flag or COMMA_API_TOKEN environmental variable)"
+  end
+
+  case options.action
+  when "query"
+
+    if options.username.nil? or options.username.empty?
+      raise "Please set the redux username (via the --username flag or REDUX_USERNAME environmental variable)"
+    end
+
+    if options.password.nil? or options.password.empty?
+      raise "Please set the redux password (via the --password flag or REDUX_PASSWORD environmental variable)"
+    end
+    query(options, logger)
+  when "status"
+    if options.filename.nil? or options.filename.empty?
+      raise "Please supply a job file"
+    end
+    status(options, logger)
+  when "results"
+    if options.filename.nil? or options.filename.empty?
+      raise "Please supply a job file"
+    end
+
+    if options.results.nil? or options.results.empty?
+      raise "Please supply a results directory"
+    else
+      FileUtils::mkdir_p options.results unless File.exists? options.results
+    end
+
+    if options.s3_bucket.nil? or options.s3_bucket.empty?
+      raise "Please set the s3 bucket (via the --s3 flag or COMMA_RESULT_STORE_S3_BUCKET environmental variable)"
+    end
+    results(options, logger)
+  when "re-run"
+    if options.filename.nil? or options.filename.empty?
+      raise "Please supply a job file"
+    end
+
+    reRun(options, logger)
+  end
+rescue Exception  => e
+  logger.error(e.message)
+  logger.error(e.backtrace)
+end
