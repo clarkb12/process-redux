@@ -72,28 +72,28 @@ def results(options, logger)
     completed = 0
     cancelled = 0
     failed = 0
-
     bucket = Aws::S3::Bucket.new(options.s3_bucket)
+
     data[:jobs].each do |job|
       logger.info job[:id]
       url = "http://#{options.host}:#{options.port.to_s}/api/jobs/#{job[:id]}?api_key=#{options.token}"
       response = Typhoeus.get(url) 
 	if !response.success?
-	  raise "Could not retrieve status for  job #{job['id']} from #{url}"
+	  raise "Could not retrieve status for  job #{job[:id]} from #{url}"
 	end
         begin
 	  data = JSON.parse(response.body, :symbolize_names => true)
           case data[:status]
-	    when 'completed'	    
+	    when :completed	    
               get_asset(options, data, job[:disk_reference], bucket)
               completed += 1
-            when 'failed'
+            when :failed
               get_errors(options, data, job[:disk_reference], bucket)
               get_output(options, data, job[:disk_reference], bucket)
               failed += 1
-            when 'pending'
+            when :pending
               pending += 1
-            when 'cancelled'
+            when :cancelled
               cancelled += 1
 	  end
 	rescue JSON::ParserError => e
@@ -202,7 +202,7 @@ def query(options, logger)
 	  raise "Could not submit job #{jobParams} to #{url}"
 	end
         begin
-	  data = JSON.parse(response.body)
+	  data = JSON.parse(response.body, :symbolize_names => true)
           jobs.push({ :id =>data[:id],:disk_reference => asset.disk_reference, :start => asset.start })
 	  pending += 1
 	rescue JSON::ParserError => e
